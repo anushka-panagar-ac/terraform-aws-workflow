@@ -1,0 +1,172 @@
+name: Validate Plan Document and Scan
+on:
+  push:
+    branches:
+      - 'main'
+      - 'release/*'
+      - 'feature/*'
+      - 'bugfix/*'
+      - 'develop'
+
+env:
+  AWS_REGION: us-west-2
+  JAVA_VERISON: 21
+
+permissions:
+  id-token: write
+  contents: write
+  security-events: write
+  actions: read
+  packages: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - name: Set environment
+        id: set-env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "::set-output name=environment::Prd"
+          elif [[ "${{ github.ref }}" == "refs/heads/release/"* ]]; then
+            echo "::set-output name=environment::UAT"
+          else
+            echo "::set-output name=environment::UAT"
+          fi
+
+      - name: Echo github environment variables
+        run: |
+          echo "AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}"
+          echo "TERRAFORM_BACKEND_PATH: ${{ vars.TERRAFORM_BACKEND_PATH }}"
+          echo "TERRAFORM_TFVARS_PATH: ${{ vars.TERRAFORM_TFVARS_PATH }}"
+          echo "AWS URL: ${{ vars.AWS_URL }}"
+
+  TF_Validate_Plan_Document:
+    runs-on: ubuntu-latest
+    needs: setup
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+          terraform_wrapper: false
+
+      - name: Configure settlement aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHub_to_AWS_via_FederatedOIDC
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd terraform
+          terraform init -reconfigure --backend-config ${{ vars.TERRAFORM_BACKEND_PATH }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          terraform plan -var-file=${{ vars.TERRAFORM_TFVARS_PATH }}
+
+  Unit-Test-Code-Coverage:
+    needs: setup
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: "corretto"
+          java-version: ${{ env.JAVA_VERISON }}
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
+          restore-keys: ${{ runner.os }}-gradle
+
+      - name: Perform Build, Test and Coverage
+        run: ./gradlew build test --info
+
+      - name: Upload Coverage Report as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coverage Report
+          path: ${{ github.workspace }}/build/reports/jacoco/test/jacocoTestReport.html
+
+      - name: Check Line Coverage
+        run: |
+          # Define the path to the JacocoTestReport.xml
+          reportPath="${{ github.workspace }}/build/reports/jacoco/test/jacocoTestReport.xml"
+          
+          # Extract the last occurrence of line coverage information
+          lineCoverage=$(grep -oP '<counter type="LINE".*?/>' "$reportPath" | tail -1)
+          covered=$(echo $lineCoverage | grep -oP 'covered="\K\d+')
+          missed=$(echo $lineCoverage | grep -oP 'missed="\K\d+')
+          
+          # Calculate coverage percentage
+          total=$(($covered + $missed))
+          coverage=$(echo "scale=2; $covered / $total * 100" | bc)
+          
+          echo "Checking for Coverage >= 80%"
+          echo "Line coverage is: $coverage%"
+          
+          # Fail if coverage is less than 80%
+          if (( $(echo "$coverage < 80" | bc -l) )); then
+            echo "Line coverage ($coverage%) is less than 80%, failing the step."
+            exit 1
+          fi
+
+  Code-Guru-Security-Scan:
+    runs-on: ubuntu-latest
+    needs: setup
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure settlement aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHub_to_AWS_via_FederatedOIDC
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CodeGuru Security
+        uses: aws-actions/codeguru-security@v1.2.2
+        with:
+          source_path: .
+          aws_region: ${{ env.AWS_REGION }}
+          fail_on_severity: Critical
+
+      - name: Print findings
+        run: |
+          ls -l
+          cat codeguru-security-results.sarif.json
+
+      - name: Upload Security Scan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeGuru Security Scan Report
+          path: codeguru-security-results.sarif.json
