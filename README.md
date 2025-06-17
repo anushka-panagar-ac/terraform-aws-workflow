@@ -1,2 +1,1 @@
-# terraform-aws-workflow
-Github workflow for Terraform and AWS Services
+# Pipeline for Terraform and AWS Services
